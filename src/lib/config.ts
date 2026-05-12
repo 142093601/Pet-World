@@ -56,7 +56,9 @@ export const DEFAULT_CHROMA_KEY = "#00FF00";
 
 // ─── API 配置 ─────────────────────────────────────────────
 export const API_BASE = "https://oa.api2d.net/v1";
-export const API_MODEL = "gpt-image-1";
+export const API_MODEL = "dall-e-3";
+// 帧生成用 dall-e-2（支持 img2img edit 接口）
+export const API_MODEL_FRAME = "dall-e-2";
 
 // ─── 动画状态映射（给 SpriteAnimation 组件用） ─────────────
 export const ANIMATION_FRAMES: Record<AnimationState, { row: number; frames: number[] }> = {
