@@ -1,12 +1,12 @@
 // ============================================================
-// imagegen.ts — 图像生成 API 封装（OpenRouter）
+// imagegen.ts — 图像生成 API 封装（API2D / OpenAI 兼容）
 // ============================================================
 //
-// 核心设计：每次只生成一个角色的一个姿态，不生成整张 sprite sheet。
-// 通过 grounding image（base pet 参考图）保持角色一致性。
+// 使用 /images/generations 接口，支持真正的 img2img。
+// 通过 `image` 参数传入参考图，模型会基于参考图生成新图。
 // ============================================================
 
-import { OPENROUTER_API_BASE, OPENROUTER_MODEL } from "./config";
+import { API_BASE, API_MODEL } from "./config";
 
 export interface GenerateResult {
   imageUrl: string;
@@ -14,124 +14,105 @@ export interface GenerateResult {
 }
 
 /**
- * 调用 OpenRouter Chat Completions API 生成单张图片
+ * 调用 /images/generations API 生成图片
+ *
+ * 支持两种模式：
+ * - 文生图：只传 prompt
+ * - 图生图：传 prompt + referenceImageUrl（作为 image 参数）
  */
 async function callImageAPI(
   prompt: string,
-  groundingImages: string[] = [],
-  aspectRatio: string = "1:1"
+  referenceImageUrl?: string
 ): Promise<GenerateResult> {
-  const apiKey = process.env.OPENROUTER_API_KEY;
+  const apiKey = process.env.IMAGE_API_KEY;
   if (!apiKey) {
-    throw new Error("缺少 OPENROUTER_API_KEY，请在 .env.local 中配置");
+    throw new Error("缺少 IMAGE_API_KEY，请在 .env.local 中配置");
   }
 
-  const content: Array<Record<string, unknown>> = [];
+  const body: Record<string, unknown> = {
+    model: API_MODEL,
+    prompt: prompt,
+    n: 1,
+    size: "1024x1024",
+  };
 
-  // 加入 grounding images（base pet 参考图）
-  for (const imgUrl of groundingImages) {
-    content.push({
-      type: "image_url",
-      image_url: { url: imgUrl },
-    });
+  // 图生图：传入参考图
+  if (referenceImageUrl) {
+    body.image = referenceImageUrl;
   }
 
-  // 加入文字提示
-  content.push({ type: "text", text: prompt });
-
-  const res = await fetch(`${OPENROUTER_API_BASE}/chat/completions`, {
+  const res = await fetch(`${API_BASE}/images/generations`, {
     method: "POST",
     headers: {
       "Authorization": `Bearer ${apiKey}`,
       "Content-Type": "application/json",
-      "HTTP-Referer": "https://pet-world.vercel.app",
-      "X-Title": "Pet World",
     },
-    body: JSON.stringify({
-      model: OPENROUTER_MODEL,
-      messages: [{ role: "user", content }],
-      modalities: ["image", "text"],
-      image_config: {
-        aspect_ratio: aspectRatio,
-        image_size: "1K",
-      },
-    }),
+    body: JSON.stringify(body),
   });
 
   if (!res.ok) {
     const errBody = await res.text();
-    throw new Error(`OpenRouter API error (${res.status}): ${errBody}`);
+    throw new Error(`API error (${res.status}): ${errBody}`);
   }
 
   const data = await res.json();
-  const message = data.choices?.[0]?.message;
-  if (!message) {
-    throw new Error("API 未返回有效响应");
+
+  // OpenAI 标准响应格式
+  const imageData = data.data?.[0];
+  if (!imageData) {
+    throw new Error("API 未返回图片数据");
   }
 
-  // 提取图片
-  if (message.images && message.images.length > 0) {
-    const imageData = message.images[0];
-    const imgUrl = imageData.image_url?.url || imageData.imageUrl?.url;
-    if (imgUrl) {
-      return { imageUrl: imgUrl, revisedPrompt: message.content || undefined };
-    }
-  }
+  // url 或 b64_json 都可能返回
+  const imageUrl = imageData.url || `data:image/png;base64,${imageData.b64_json}`;
 
-  if (Array.isArray(message.content)) {
-    for (const part of message.content) {
-      if (part.type === "image_url" && part.image_url?.url) {
-        return { imageUrl: part.image_url.url };
-      }
-    }
-  }
-
-  const textContent = typeof message.content === "string" ? message.content : "";
-  throw new Error(`API 未返回图片数据。响应内容: ${textContent.substring(0, 200)}`);
+  return { imageUrl, revisedPrompt: data.revised_prompt || undefined };
 }
 
 /**
  * 生成 base pet（基准角色图）
  *
  * Pipeline 第一步。产出的角色图将作为所有后续帧生成的锚点。
+ * chromaKey 参数确保 base pet 的背景色与后续帧一致。
  */
 export async function generateBasePet(
   description: string,
-  referenceImageUrl?: string
+  referenceImageUrl?: string,
+  chromaKey: string = "#00FF00"
 ): Promise<GenerateResult> {
   const prompt = `A single cute chibi pixel art character for a virtual pet game, facing forward.
 Character description: ${description}
 Style: Cute chibi, thick black outlines, limited color palette (max 8 colors), flat cel shading, pixel art aesthetic, adorable proportions with big head and small body.
 The character should be centered in the image, standing in a neutral idle pose.
-Background: solid chroma key green (#00FF00) for easy removal.
+Background: solid ${chromaKey} for easy removal.
 Clean pixel art, no anti-aliasing, no gradients, crisp edges.
 Only ONE character, centered, with clear space around it.`;
 
-  const groundingImages = referenceImageUrl ? [referenceImageUrl] : [];
-  return callImageAPI(prompt, groundingImages, "1:1");
+  return callImageAPI(prompt, referenceImageUrl);
 }
 
 /**
  * 生成单帧动画
  *
- * 以 base pet 作为 grounding image，确保角色一致性。
+ * 以 base pet 作为参考图（img2img），确保角色一致性。
  * 每次只生成一个姿态，prompt 更聚焦，质量更高。
  */
 export async function generateFrame(
   description: string,
   frameDescription: string,
-  groundingImages: string[],
+  referenceImageUrl: string,
   chromaKey: string
 ): Promise<GenerateResult> {
-  const prompt = `Generate a SINGLE animation frame of this exact same character.
+  const prompt = `This is the EXACT same character from the reference image. Do not change anything about the character design.
+Generate a SINGLE animation frame of this character in a new pose.
 Pose: ${frameDescription}
 Character description: ${description}
-Style: MUST match the reference character exactly — same colors, same proportions, same outlines, same art style.
+Style: MUST be identical to the reference — same colors, same proportions, same outlines, same art style, same size.
 Cute chibi pixel art, thick black outlines, limited color palette, flat cel shading.
-Background: solid ${chromaKey} (chroma key) for easy removal.
+Background: solid ${chromaKey} for easy removal.
 Clean pixel art, no anti-aliasing, no gradients, crisp edges.
 Only ONE character, centered, same size as reference.
-IMPORTANT: The character design must be IDENTICAL to the reference image. Do not change species, colors, markings, accessories, or proportions.`;
+CRITICAL: Keep the character design 100% identical. Only change the pose.`;
 
-  return callImageAPI(prompt, groundingImages, "1:1");
+  return callImageAPI(prompt, referenceImageUrl);
 }

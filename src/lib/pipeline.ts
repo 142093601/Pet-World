@@ -2,17 +2,20 @@
 // pipeline.ts — Sprite 生成 Pipeline 编排器
 // ============================================================
 //
-// 核心设计（借鉴 Codex hatch-pet）：
+// 核心设计：
 //
 //   Step 1: 生成 base pet（基准角色图）
 //   Step 2: 采样主色调 → 选择最佳 chroma key
-//   Step 3: 以 base pet 为 grounding image，逐帧生成 6 个姿态
-//   Step 4: 从每张生成图中提取角色帧（去背景）
-//   Step 5: 拼装成 sprite sheet atlas
-//   Step 6: QA 验证
+//   Step 3: 用统一的 chroma key 重新生成 base pet
+//   Step 4: 以 base pet 为参考，逐帧生成姿态（img2img）
+//   Step 5: 从每张生成图中提取角色帧（去背景 + 居中对齐）
+//   Step 6: 拼装成 sprite sheet atlas
+//   Step 7: QA 验证
 //
-// 这种方式解决了"一次生成整张 sprite sheet"导致的角色不一致问题。
-// 每帧都锚定在同一张 base pet 上，大幅提高一致性。
+// 关键改进：
+// - base pet 和所有帧使用同一个 chroma key
+// - 使用真正的 img2img（非 multimodal 理解）
+// - 帧提取时检测角色边界并居中对齐
 // ============================================================
 
 import { generateBasePet, generateFrame } from "./imagegen";
@@ -49,7 +52,7 @@ export async function runPipeline(
   onProgress?: ProgressCallback
 ): Promise<PipelineResult> {
   const { description, referenceImageUrl, frameWidth, frameHeight } = config;
-  const totalSteps = 2 + ALL_FRAMES.length + 2; // base + chroma + N frames + compose + QA
+  const totalSteps = 3 + ALL_FRAMES.length + 2; // base + chroma + re-base + N frames + compose + QA
   let currentStep = 0;
 
   const report = (step: string) => {
@@ -58,7 +61,7 @@ export async function runPipeline(
   };
 
   // ═══════════════════════════════════════════════════════
-  // Step 1: 生成 Base Pet（基准角色）
+  // Step 1: 生成初始 Base Pet（用于颜色采样）
   // ═══════════════════════════════════════════════════════
   report("正在生成基准角色...");
   const baseResult = await generateBasePet(description, referenceImageUrl);
@@ -72,7 +75,15 @@ export async function runPipeline(
   const chromaKey = selectChromaKey(dominantColors);
 
   // ═══════════════════════════════════════════════════════
-  // Step 3: 逐帧生成（以 base pet 为 grounding image）
+  // Step 3: 用统一的 chroma key 重新生成 base pet
+  //         确保背景色与后续帧一致
+  // ═══════════════════════════════════════════════════════
+  report("正在生成统一背景的基准角色...");
+  const baseFinal = await generateBasePet(description, referenceImageUrl, chromaKey);
+  const baseFinalBuffer = await downloadImage(baseFinal.imageUrl);
+
+  // ═══════════════════════════════════════════════════════
+  // Step 4: 逐帧生成（以 base pet 为 img2img 参考）
   // ═══════════════════════════════════════════════════════
   const frameBuffers: Buffer[] = [];
   const framePreviews: string[] = [];
@@ -83,7 +94,7 @@ export async function runPipeline(
     const frameResult = await generateFrame(
       description,
       frame.description,
-      [baseResult.imageUrl], // 始终以 base pet 为 grounding
+      baseFinal.imageUrl, // 始终以最终 base pet 为 img2img 参考
       chromaKey
     );
 
@@ -95,7 +106,7 @@ export async function runPipeline(
   }
 
   // ═══════════════════════════════════════════════════════
-  // Step 4: 拼装 Atlas
+  // Step 5: 拼装 Atlas
   // ═══════════════════════════════════════════════════════
   report("正在拼装 sprite sheet...");
   const atlasBuffer = await composeAtlas(frameBuffers);
@@ -106,7 +117,7 @@ export async function runPipeline(
   }
 
   // ═══════════════════════════════════════════════════════
-  // Step 5: QA 验证
+  // Step 6: QA 验证
   // ═══════════════════════════════════════════════════════
   report("正在执行 QA 验证...");
   const qa = await runQA(atlasBuffer);
